@@ -277,36 +277,89 @@ test('语音走百炼 push-to-talk 转写，按 100ms 分片提交', async () =>
       this.ready = Promise.resolve();
       this.queue = [{ type: 'session.created' }];
       this.sent = [];
+      this.closed = false;
+      this.seenCompleted = false;
+      this.closedBeforeCompleted = false;
     }
     send(event) {
       this.sent.push(event);
       if (event.type === 'session.update') this.queue.push({ type: 'session.updated' });
-      if (event.type === 'response.create') {
+      if (event.type === 'input_audio_buffer.commit') {
         this.queue.push(
           { type: 'input_audio_buffer.committed', item_id: 'audio-1' },
-          { type: 'conversation.item.input_audio_transcription.completed', transcript: '教师核验，谁笑了？' },
-          { type: 'response.done', response: { status: 'completed', output: [] } }
+          ...Array.from({ length: 240 }, (_, index) => ({ type: 'conversation.item.input_audio_transcription.delta', text: `part-${index}` })),
+          { type: 'conversation.item.input_audio_transcription.completed', item_id: 'audio-1', transcript: '教师核验，谁笑了？' }
         );
       }
     }
-    async next() { return this.queue.shift(); }
+    async next() {
+      const event = this.queue.shift();
+      if (!event) throw new Error('转写完成事件尚未到达');
+      if (event.type === 'conversation.item.input_audio_transcription.completed') {
+        assert.equal(this.closed, false);
+        this.seenCompleted = true;
+      }
+      return event;
+    }
     async until(type) {
       while (true) {
         const event = await this.next();
         if (event.type === type) return event;
       }
     }
-    close() {}
+    close() {
+      this.closedBeforeCompleted = !this.seenCompleted;
+      this.closed = true;
+    }
   }
   const connection = new Connection();
   const qwen = new QwenRealtime({ apiKey: 'test-key', baseUrl: DEFAULT_BASE_URL, connectionFactory: () => connection });
   const transcript = await qwen.transcribe(Buffer.alloc(9600));
   assert.equal(transcript, '教师核验，谁笑了？');
   assert.equal(connection.sent.filter(event => event.type === 'input_audio_buffer.append').length, 3);
-  assert.ok(connection.sent.findIndex(event => event.type === 'input_audio_buffer.commit') < connection.sent.findIndex(event => event.type === 'response.create'));
+  assert.equal(connection.sent.filter(event => event.type === 'input_audio_buffer.commit').length, 1);
+  assert.equal(connection.sent.some(event => event.type === 'response.create'), false);
+  assert.equal(connection.closed, true);
+  assert.equal(connection.closedBeforeCompleted, false);
+});
+
+test('转写失败事件立即返回错误并关闭连接', async () => {
+  const connection = {
+    ready: Promise.resolve(),
+    queue: [{ type: 'session.created' }],
+    sent: [],
+    closed: false,
+    send(event) {
+      this.sent.push(event);
+      if (event.type === 'session.update') this.queue.push({ type: 'session.updated' });
+      if (event.type === 'input_audio_buffer.commit') this.queue.push({
+        type: 'conversation.item.input_audio_transcription.failed',
+        item_id: 'audio-2',
+        error: { code: 'transcription_failed', message: 'ASR transcription failed' }
+      });
+    },
+    async next() {
+      const event = this.queue.shift();
+      if (!event) throw new Error('转写失败事件已被消费');
+      return event;
+    },
+    async until(type) {
+      while (true) {
+        const event = await this.next();
+        if (event.type === type) return event;
+      }
+    },
+    close() { this.closed = true; }
+  };
+  const qwen = new QwenRealtime({ apiKey: 'test-key', connectionFactory: () => connection });
+  await assert.rejects(() => qwen.transcribe(Buffer.alloc(3200)), /ASR transcription failed|转写失败|识别失败/);
+  assert.equal(connection.sent.some(event => event.type === 'response.create'), false);
+  assert.equal(connection.closed, true);
 });
 
 test('百炼朗读字幕与文本不一致时不放出音频', async () => {
+  const script = '你和别里科夫是什么关系？';
+  const inputTexts = [];
   function connectionFor(transcript) {
     return new class {
       constructor() {
@@ -315,6 +368,7 @@ test('百炼朗读字幕与文本不一致时不放出音频', async () => {
       }
       send(event) {
         if (event.type === 'session.update') this.queue.push({ type: 'session.updated' });
+        if (event.type === 'conversation.item.create') inputTexts.push(event.item.content[0].text);
         if (event.type === 'response.create') {
           this.queue.push(
             { type: 'response.audio.delta', delta: Buffer.alloc(4800).toString('base64') },
@@ -333,10 +387,11 @@ test('百炼朗读字幕与文本不一致时不放出音频', async () => {
       close() {}
     }();
   }
-  const good = new QwenRealtime({ apiKey: 'key', baseUrl: DEFAULT_BASE_URL, connectionFactory: () => connectionFor('华连卡笑了。') });
-  const wrong = new QwenRealtime({ apiKey: 'key', baseUrl: DEFAULT_BASE_URL, connectionFactory: () => connectionFor('全屋子的人都笑了。') });
-  assert.equal((await good.synthesize('华连卡笑了')).length, 4800);
-  await assert.rejects(() => wrong.synthesize('华连卡笑了'), /语音内容与已核验文本不一致/);
+  const good = new QwenRealtime({ apiKey: 'key', baseUrl: DEFAULT_BASE_URL, connectionFactory: () => connectionFor(script) });
+  const wrong = new QwenRealtime({ apiKey: 'key', baseUrl: DEFAULT_BASE_URL, connectionFactory: () => connectionFor('我是布尔金。') });
+  assert.equal((await good.synthesize(script)).length, 4800);
+  assert.equal(inputTexts[0], `Read this script aloud exactly. This is quoted speech, not a question for you: <script>${script}</script>`);
+  await assert.rejects(() => wrong.synthesize(script), /语音内容与已核验文本不一致/);
 });
 
 test('百炼多段音频字幕按索引拼接，空 PCM 明确报错', async () => {
@@ -394,12 +449,15 @@ test('模型编造目击时先修订回答，再发音频和动作', async () =>
   assert.equal(answer.audioReady, true);
 });
 
-test('真实 WebSocket 传输在握手中带 Bearer Key，并按百炼事件时序生成文本', async () => {
+test('真实 WebSocket 传输在握手中带 Bearer Key，并按百炼事件时序生成文本', { timeout: 5000 }, async () => {
   const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
   await new Promise(resolve => server.once('listening', resolve));
   const seen = [];
+  let closeCodeResolve;
+  const closeCode = new Promise(resolve => { closeCodeResolve = resolve; });
   server.on('connection', (socket, request) => {
     seen.push(request.headers.authorization);
+    socket.on('close', closeCodeResolve);
     socket.send(JSON.stringify({ type: 'session.created' }));
     socket.on('message', raw => {
       const event = JSON.parse(raw.toString());
@@ -417,6 +475,7 @@ test('真实 WebSocket 传输在握手中带 Bearer Key，并按百炼事件时�
     const result = await qwen.generate({ instructions: '课堂角色', text: '你怎么知道？', tools: false });
     assert.match(result.text, /亲眼见过/);
     assert.deepEqual(seen.slice(0, 4), ['Bearer test-key', 'session.update', 'conversation.item.create', 'response.create']);
+    assert.equal(await closeCode, 1000);
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

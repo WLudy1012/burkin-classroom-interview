@@ -44,7 +44,7 @@ npm run dist:win
 ## 实现与边界
 
 - 人物事实边界和对话规则见 [角色设定](./desktop/runtime/persona.txt)。普通回答目标为 50–100 字，复杂问题上限 140 字。
-- 同一个 Qwen Realtime 模型完成语音转写、回答生成和语音输出。文字提问直接进入同一套回答、事实检查、动作和播报流程。客户端在播放前清理动作标签，检查文本事实、长度与语音字幕；验证失败时会显示具体原因，不会播报未经核验的内容。语音输入为 16 kHz PCM，模型输出为 24 kHz PCM。音色复刻仅在主动导入录音时使用独立的创建接口，正常访谈仍只调用 Flash 模型；[模型语音格式说明](https://help.aliyun.com/zh/model-studio/qwen-audio-realtime-user-guides)。
+- 同一个 Qwen Realtime 模型完成语音转写、回答生成和语音输出。录音提交后等待最终转写事件，不额外生成回答；文字提问直接进入同一套回答、事实检查、动作和播报流程。客户端在播放前清理动作标签，检查文本事实、长度与语音字幕；播报台词按引文逐字朗读，字幕不一致时不会播放。语音输入为 16 kHz PCM，模型输出为 24 kHz PCM。音色复刻仅在主动导入录音时使用独立的创建接口，正常访谈仍只调用 Flash 模型；[模型语音格式说明](https://help.aliyun.com/zh/model-studio/qwen-audio-realtime-user-guides)。
 - 模型可通过同一 Realtime API 的 Function Calling 输出动作信号。应用只接受预定义动作，每轮最多执行一个，然后驱动本地透明人物图层；[Function Calling 事件说明](https://help.aliyun.com/zh/model-studio/qwen-audio-realtime-user-guides)。
 - 舞台有访谈室、骑车街道、旧宅楼梯、墓园归途和教师资料室五张完整背景。客户端根据语音转写及回答中的明确情境词自动切换，教师核验时切到资料室；背景切换不增加模型调用。
 - 舞台和人物的九张运行时图片采用 WebP，合计约 1.76 MB。口型音量更新限制在约每秒 30 次，并跳过未变化的样式值。

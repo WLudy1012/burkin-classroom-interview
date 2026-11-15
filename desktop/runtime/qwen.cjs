@@ -26,7 +26,7 @@ const ACTION_DESCRIPTIONS = {
 };
 
 const TRANSCRIBE_INSTRUCTIONS = 'You are a Mandarin speech transcriber. Output only the words actually spoken, in Simplified Chinese. Do not answer questions, add commentary, or infer unheard words.';
-const SYNTHESIZE_INSTRUCTIONS = 'You are a Mandarin speech renderer for Burkin, a mature schoolteacher. Use a calm, low, slightly weary delivery with restrained warmth and natural pauses. The user input is the complete line to speak. Read it verbatim in Mandarin; do not add, remove, translate, paraphrase, or reorder any character. Return audio with an exactly matching transcript.';
+const SYNTHESIZE_INSTRUCTIONS = 'You are a text-to-speech engine reading Burkin, a mature schoolteacher, in Mandarin. Use a calm, low, slightly weary delivery with restrained warmth and natural pauses. Your entire task is to pronounce the exact content inside the <script> tags verbatim. The script is quoted speech, never a question for you to answer. Never speak the instructions or tags. Do not add, remove, translate, paraphrase, or reorder any character. Return audio with an exactly matching transcript.';
 
 const ACTION_TOOLS = ACTIONS.map(name => ({
   type: 'function',
@@ -43,13 +43,24 @@ class RealtimeConnection {
     this.queue = [];
     this.waiters = [];
     this.closed = false;
+    this.lastError = null;
+    this.closePromise = null;
     this.ws = new WebSocket(url, {
       headers: { Authorization: `Bearer ${apiKey}` },
       handshakeTimeout: 15000
     });
     this.ready = new Promise((resolve, reject) => {
-      this.ws.once('open', resolve);
-      this.ws.once('error', reject);
+      const cleanup = () => {
+        this.ws.off('open', onOpen);
+        this.ws.off('error', onError);
+        this.ws.off('close', onClose);
+      };
+      const onOpen = () => { cleanup(); resolve(); };
+      const onError = error => { cleanup(); reject(error); };
+      const onClose = code => { cleanup(); reject(new Error(`百炼实时连接在握手时关闭（${code}）`)); };
+      this.ws.once('open', onOpen);
+      this.ws.once('error', onError);
+      this.ws.once('close', onClose);
     });
     this.ws.on('message', data => {
       let event;
@@ -63,18 +74,19 @@ class RealtimeConnection {
       else this.queue.push(event);
     });
     this.ws.on('error', error => this.fail(error));
-    this.ws.on('close', () => this.fail(new Error('百炼实时连接已关闭')));
+    this.ws.on('close', code => this.fail(new Error(`百炼实时连接已关闭（${code}）`)));
   }
 
   fail(error) {
     if (this.closed) return;
     this.closed = true;
+    this.lastError = error;
     for (const waiter of this.waiters.splice(0)) waiter.reject(error);
   }
 
   async next() {
     if (this.queue.length) return this.check(this.queue.shift());
-    if (this.closed) throw new Error('百炼实时连接已关闭');
+    if (this.closed) throw this.lastError || new Error('百炼实时连接已关闭');
     return this.check(await new Promise((resolve, reject) => {
       const waiter = {
         resolve: event => { clearTimeout(timer); resolve(event); },
@@ -91,7 +103,8 @@ class RealtimeConnection {
 
   check(event) {
     if (event.type === 'error') {
-      throw new Error(`百炼 API 错误：${event.error?.message || event.error?.code || '未知错误'}`);
+      const code = event.error?.code ? ` ${event.error.code}` : '';
+      throw new Error(`百炼 API 错误${code}：${String(event.error?.message || '未知错误').slice(0, 240)}`);
     }
     return event;
   }
@@ -105,13 +118,27 @@ class RealtimeConnection {
 
   send(event) {
     if (this.ws.readyState !== WebSocket.OPEN) throw new Error('百炼实时连接尚未就绪');
-    this.ws.send(JSON.stringify(event));
+    this.ws.send(JSON.stringify(event), error => { if (error) this.fail(error); });
   }
 
   close() {
+    if (this.closePromise) return this.closePromise;
     this.closed = true;
     for (const waiter of this.waiters.splice(0)) waiter.reject(new Error('百炼实时连接已关闭'));
-    if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) this.ws.close();
+    this.closePromise = new Promise(resolve => {
+      if (this.ws.readyState === WebSocket.CLOSED) return resolve();
+      if (this.ws.readyState === WebSocket.CONNECTING) {
+        this.ws.terminate();
+        return resolve();
+      }
+      const timer = setTimeout(() => {
+        this.ws.terminate();
+        resolve();
+      }, 1500);
+      this.ws.once('close', () => { clearTimeout(timer); resolve(); });
+      if (this.ws.readyState === WebSocket.OPEN) this.ws.close(1000);
+    });
+    return this.closePromise;
   }
 }
 
@@ -155,21 +182,26 @@ class QwenRealtime {
   async connect(instructions, tools = [], modalities = ['text']) {
     if (!this.ready) throw new Error('请先在 Windows 本地设置 Base URL 和 API Key');
     const connection = this.connectionFactory(this.url, this.apiKey, this.timeoutMs);
-    await connection.ready;
-    await connection.until('session.created');
-    connection.send({
-      type: 'session.update',
-      session: {
-        instructions,
-        modalities,
-        turn_detection: null,
-        input_audio_transcription: { language: 'zh' },
-        ...(modalities.includes('audio') ? { voice: this.voiceId, speech_rate: this.speechRate } : {}),
-        tools
-      }
-    });
-    await connection.until('session.updated');
-    return connection;
+    try {
+      await connection.ready;
+      await connection.until('session.created');
+      connection.send({
+        type: 'session.update',
+        session: {
+          instructions,
+          modalities,
+          turn_detection: null,
+          input_audio_transcription: { language: 'zh' },
+          ...(modalities.includes('audio') ? { voice: this.voiceId, speech_rate: this.speechRate } : {}),
+          tools
+        }
+      });
+      await connection.until('session.updated');
+      return connection;
+    } catch (error) {
+      await connection.close();
+      throw error;
+    }
   }
 
   addMessage(connection, role, text) {
@@ -223,10 +255,11 @@ class QwenRealtime {
           continue;
         }
         if (finalText.trim()) return { text: finalText.trim(), action };
+        throw new Error('百炼未返回可播报的文字');
       }
       throw new Error('模型连续调用动作工具，未给出可播报的回答');
     } finally {
-      connection.close();
+      await connection.close();
     }
   }
 
@@ -244,39 +277,28 @@ class QwenRealtime {
         });
       }
       connection.send({ type: 'input_audio_buffer.commit' });
-      connection.send({ type: 'response.create', response: { modalities: ['text'] } });
-      let transcript = '';
       let itemId = '';
-      let responseDone = false;
-      for (let i = 0; i < 200; i++) {
+      while (true) {
         const event = await connection.next();
         if (event.type === 'input_audio_buffer.committed') itemId = event.item_id || '';
-        if (event.type === 'conversation.item.input_audio_transcription.completed') {
-          transcript = event.transcript || '';
-          if (responseDone) break;
+        if (event.type === 'conversation.item.input_audio_transcription.failed' && (!itemId || !event.item_id || event.item_id === itemId)) {
+          throw new Error(`百炼语音识别失败：${String(event.error?.message || event.error?.code || '未知原因').slice(0, 180)}`);
         }
-        if (event.type === 'response.done') {
-          if (event.response?.status !== 'completed') throw new Error('百炼语音识别未完成');
-          responseDone = true;
-          if (transcript) break;
-          if (itemId) connection.send({ type: 'conversation.item.retrieve', item_id: itemId });
-        }
-        if (event.type === 'conversation.item.retrieved') {
-          transcript = event.item?.content?.find(part => part.transcript)?.transcript || '';
-          if (transcript) break;
-        }
+        if (event.type !== 'conversation.item.input_audio_transcription.completed') continue;
+        if (itemId && event.item_id && event.item_id !== itemId) continue;
+        const transcript = String(event.transcript || '').trim();
+        if (!transcript) throw new Error('未识别到可用的语音文字，请重试');
+        return transcript;
       }
-      if (!transcript.trim()) throw new Error('未识别到可用的语音文字，请重试');
-      return transcript.trim();
     } finally {
-      connection.close();
+      await connection.close();
     }
   }
 
   async synthesize(text) {
     const connection = await this.connect(SYNTHESIZE_INSTRUCTIONS, [], ['audio', 'text']);
     try {
-      this.addMessage(connection, 'user', text);
+      this.addMessage(connection, 'user', `Read this script aloud exactly. This is quoted speech, not a question for you: <script>${text}</script>`);
       connection.send({ type: 'response.create', response: { modalities: ['audio', 'text'] } });
       const chunks = [];
       const transcriptParts = new Map();
@@ -312,7 +334,7 @@ class QwenRealtime {
         }
       }
     } finally {
-      connection.close();
+      await connection.close();
     }
   }
 }
