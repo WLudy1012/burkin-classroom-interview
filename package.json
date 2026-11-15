@@ -1,0 +1,47 @@
+{
+  "name": "burkin-classroom-interview",
+  "version": "1.0.7",
+  "private": true,
+  "license": "MIT",
+  "description": "布尔金文学角色数字人课堂访谈",
+  "main": "desktop/main.cjs",
+  "scripts": {
+    "desktop": "electron .",
+    "web": "node web/start.cjs",
+    "web:server": "node web/start.cjs --no-open",
+    "test": "node --test test/*.test.cjs",
+    "dist:win": "electron-builder --win nsis",
+    "dist:web": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package_webui.ps1"
+  },
+  "dependencies": {
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "cn.school.burkin.interview",
+    "productName": "布尔金课堂访谈",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "web/**/*",
+      "LICENSE",
+      "!desktop/assets/scene-*.png",
+      "!desktop/assets/burkin-*.png",
+      "package.json"
+    ],
+    "win": {
+      "icon": "desktop/assets/icon.ico",
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}
